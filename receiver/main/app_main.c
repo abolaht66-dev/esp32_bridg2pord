@@ -1,165 +1,141 @@
-/* SPI Slave example, receiver (uses SPI Slave driver to communicate with sender)
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
 #include <string.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
+#include "freertos/ringbuf.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "driver/spi_slave.h"
 #include "driver/gpio.h"
 
-/*
-SPI receiver (slave) example.
+#define TAG "FULL_DUPLEX_SLAVE"
 
-This example is supposed to work together with the SPI sender. It uses the standard SPI pins (MISO, MOSI, SCLK, CS) to
-transmit data over in a full-duplex fashion, that is, while the master puts data on the MOSI pin, the slave puts its own
-data on the MISO pin.
-
-This example uses one extra pin: GPIO_HANDSHAKE is used as a handshake pin. After a transmission has been set up and we're
-ready to send/receive data, this code uses a callback to set the handshake pin high. The sender will detect this and start
-sending a transaction. As soon as the transaction is done, the line gets set low again.
-*/
-
-/*
-Pins in use. The SPI Master can use the GPIO mux, so feel free to change these if needed.
-*/
-#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
-#define GPIO_HANDSHAKE 2
 #define GPIO_MOSI 12
 #define GPIO_MISO 13
 #define GPIO_SCLK 15
-#define GPIO_CS 14
-
-#elif CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C2
-#define GPIO_HANDSHAKE 3
-#define GPIO_MOSI 7
-#define GPIO_MISO 2
-#define GPIO_SCLK 6
-#define GPIO_CS 10
-
-#elif CONFIG_IDF_TARGET_ESP32C6
-#define GPIO_HANDSHAKE 15
-#define GPIO_MOSI 19
-#define GPIO_MISO 20
-#define GPIO_SCLK 18
-#define GPIO_CS 9
-
-#elif CONFIG_IDF_TARGET_ESP32H2
+#define GPIO_CS   14
 #define GPIO_HANDSHAKE 2
-#define GPIO_MOSI 5
-#define GPIO_MISO 0
-#define GPIO_SCLK 4
-#define GPIO_CS 1
 
-#elif CONFIG_IDF_TARGET_ESP32S3
-#define GPIO_HANDSHAKE 2
-#define GPIO_MOSI 11
-#define GPIO_MISO 13
-#define GPIO_SCLK 12
-#define GPIO_CS 10
+#define BUFFER_SIZE 1600
 
-#endif //CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+static RingbufHandle_t uplink_ringbuf; // لحزم الـ Uplink (من الأجهزة لـ SPI)
 
-#ifdef CONFIG_IDF_TARGET_ESP32
-#define RCV_HOST    HSPI_HOST
+WORD_ALIGNED_ATTR static uint8_t slave_tx_buf[BUFFER_SIZE];
+WORD_ALIGNED_ATTR static uint8_t slave_rx_buf[BUFFER_SIZE];
 
-#else
-#define RCV_HOST    SPI2_HOST
+// 1. الالتقاط المباشر لبيانات الأجهزة المتصلة بالـ AP
+static void wifi_ap_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
 
-#endif
-
-//Called after a transaction is queued and ready for pickup by master. We use this to set the handshake line high.
-void my_post_setup_cb(spi_slave_transaction_t *trans)
-{
-    gpio_set_level(GPIO_HANDSHAKE, 1);
+    if (len > 0 && len <= BUFFER_SIZE) {
+        xRingbufferSend(uplink_ringbuf, pkt->payload, len, pdMS_TO_TICKS(5));
+    }
 }
 
-//Called after transaction is sent/received. We use this to set the handshake line low.
-void my_post_trans_cb(spi_slave_transaction_t *trans)
-{
-    gpio_set_level(GPIO_HANDSHAKE, 0);
+// 2. مهمة تبادل الـ SPI للطرف المستجيب
+static void spi_slave_duplex_task(void *pvParameters) {
+    size_t item_size = 0;
+    spi_slave_transaction_t t;
+
+    while (1) {
+        memset(slave_tx_buf, 0, BUFFER_SIZE);
+        memset(slave_rx_buf, 0, BUFFER_SIZE);
+
+        // سحب حزمة Uplink لإرسالها نحو Master
+        uint8_t *item = (uint8_t *)xRingbufferReceive(uplink_ringbuf, &item_size, pdMS_TO_TICKS(2));
+        if (item != NULL) {
+            memcpy(slave_tx_buf, item, item_size);
+            vRingbufferReturnItem(uplink_ringbuf, (void *)item);
+        }
+
+        memset(&t, 0, sizeof(t));
+        t.length = BUFFER_SIZE * 8;
+        t.tx_buffer = slave_tx_buf;
+        t.rx_buffer = slave_rx_buf;
+
+        // رفع إشارة الجاهزية
+        gpio_set_level(GPIO_HANDSHAKE, 1);
+
+        // التنفيذ والتزامن مع Master عبر الـ DMA
+        esp_err_t ret = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
+
+        // إنزال الإشارة
+        gpio_set_level(GPIO_HANDSHAKE, 0);
+
+        if (ret == ESP_OK) {
+            // حقن حزمة الـ Downlink القادمة من Master نحو الأجهزة
+            uint16_t rx_len = t.trans_len / 8;
+            if (rx_len > 0 && rx_len <= BUFFER_SIZE) {
+                esp_wifi_80211_tx(WIFI_IF_AP, slave_rx_buf, rx_len, false);
+            }
+        }
+    }
 }
 
-//Main application
-void app_main(void)
-{
-    int n = 0;
-    esp_err_t ret;
+static void init_spi_slave(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_HANDSHAKE),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+    };
+    gpio_config(&io_conf);
 
-    //Configuration for the SPI bus
     spi_bus_config_t buscfg = {
-        .mosi_io_num = GPIO_MOSI,
         .miso_io_num = GPIO_MISO,
+        .mosi_io_num = GPIO_MOSI,
         .sclk_io_num = GPIO_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
+        .max_transfer_sz = BUFFER_SIZE,
     };
 
-    //Configuration for the SPI slave interface
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
         .spics_io_num = GPIO_CS,
-        .queue_size = 3,
-        .flags = 0,
-        .post_setup_cb = my_post_setup_cb,
-        .post_trans_cb = my_post_trans_cb
+        .queue_size = 7,
     };
 
-    //Configuration for the handshake line
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1 << GPIO_HANDSHAKE)
+    ESP_ERROR_CHECK(spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO));
+}
+
+static void init_wifi_ap(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "ESP32_L2_BRIDGE",
+            .ssid_len = strlen("ESP32_L2_BRIDGE"),
+            .channel = 1,
+            .max_connection = 10,
+            .authmode = WIFI_AUTH_OPEN,
+        },
     };
 
-    //Configure handshake line as output
-    gpio_config(&io_conf);
-    //Enable pull-ups on SPI lines so we don't detect rogue pulses when no master is connected.
-    gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-    //Initialize SPI slave interface
-    ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
-    assert(ret == ESP_OK);
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&wifi_ap_promiscuous_cb));
+}
 
-    WORD_ALIGNED_ATTR char sendbuf[129] = "";
-    WORD_ALIGNED_ATTR char recvbuf[129] = "";
-    memset(recvbuf, 0, 33);
-    spi_slave_transaction_t t;
-    memset(&t, 0, sizeof(t));
+void app_main(void) {
+    ESP_LOGI(TAG, "Starting Slave Full-Duplex Node...");
+    uplink_ringbuf = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_NOSPLIT);
 
-    while (1) {
-        //Clear receive buffer, set send buffer to something sane
-        memset(recvbuf, 0xA5, 129);
-        sprintf(sendbuf, "This is the receiver, sending data for transmission number %04d.", n);
+    init_wifi_ap();
+    init_spi_slave();
 
-        //Set up a transaction of 128 bytes to send/receive
-        t.length = 128 * 8;
-        t.tx_buffer = sendbuf;
-        t.rx_buffer = recvbuf;
-        /* This call enables the SPI slave interface to send/receive to the sendbuf and recvbuf. The transaction is
-        initialized by the SPI master, however, so it will not actually happen until the master starts a hardware transaction
-        by pulling CS low and pulsing the clock etc. In this specific example, we use the handshake line, pulled up by the
-        .post_setup_cb callback that is called as soon as a transaction is ready, to let the master know it is free to transfer
-        data.
-        */
-        ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
-
-        //spi_slave_transmit does not return until the master has done a transmission, so by here we have sent our data and
-        //received data from the master. Print it.
-        printf("Received: %s\n", recvbuf);
-        n++;
-    }
-
+    xTaskCreate(spi_slave_duplex_task, "spi_slave_duplex_task", 4096, NULL, 5, NULL);
 }
