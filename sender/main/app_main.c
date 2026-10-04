@@ -1,155 +1,167 @@
-/* SPI Slave example, sender (uses SPI master driver)
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
 #include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
 #include <string.h>
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
+#include "freertos/ringbuf.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
-#include "esp_timer.h"
 
-/*
-SPI sender (master) example.
+#define TAG "L2_SPI_MASTER"
 
-This example is supposed to work together with the SPI receiver. It uses the standard SPI pins (MISO, MOSI, SCLK, CS) to
-transmit data over in a full-duplex fashion, that is, while the master puts data on the MOSI pin, the slave puts its own
-data on the MISO pin.
+// ==========================================
+// 1. إعدادات شبكة الراوتر الرئيسي (عدلها لشبكتك)
+// ==========================================
+#define ROUTER_SSID     "YOUR_ROUTER_SSID"     // اكتب اسم شبكة الراوتر هنا
+#define ROUTER_PASSWORD "YOUR_ROUTER_PASSWORD" // اكتب كلمة سر الراوتر هنا
 
-This example uses one extra pin: GPIO_HANDSHAKE is used as a handshake pin. The slave makes this pin high as soon as it is
-ready to receive/send data. This code connects this line to a GPIO interrupt which gives the rdySem semaphore. The main
-task waits for this semaphore to be given before queueing a transmission.
-*/
+// ==========================================
+// 2. تعيين دبابيس توصيل الـ SPI والإشارات
+// ==========================================
+#define GPIO_MOSI 12
+#define GPIO_MISO 13
+#define GPIO_SCLK 15
+#define GPIO_CS   14
+#define GPIO_HANDSHAKE 2  // دبوس استقبال إشارة الجاهزية من الـ Slave
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////// Please update the following configuration according to your HardWare spec /////////////////
-//////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define GPIO_HANDSHAKE      2
-#define GPIO_MOSI           12
-#define GPIO_MISO           13
-#define GPIO_SCLK           15
-#define GPIO_CS             14
+#define BUFFER_SIZE 1600
 
-#ifdef CONFIG_IDF_TARGET_ESP32
-#define SENDER_HOST HSPI_HOST
-#else
-#define SENDER_HOST SPI2_HOST
-#endif
+static spi_device_handle_t spi_handle;
+static RingbufHandle_t tx_ringbuf; // ذاكرة موقتة للحزم القادمة من الهواء المتجهة إلى SPI
 
-//The semaphore indicating the slave is ready to receive stuff.
-static QueueHandle_t rdySem;
+WORD_ALIGNED_ATTR static uint8_t master_tx_buf[BUFFER_SIZE];
+WORD_ALIGNED_ATTR static uint8_t master_rx_buf[BUFFER_SIZE];
 
-/*
-This ISR is called when the handshake line goes high.
-*/
-static void IRAM_ATTR gpio_handshake_isr_handler(void* arg)
-{
-    //Sometimes due to interference or ringing or something, we get two irqs after eachother. This is solved by
-    //looking at the time between interrupts and refusing any interrupt too close to another one.
-    static uint32_t lasthandshaketime_us;
-    uint32_t currtime_us = esp_timer_get_time();
-    uint32_t diff = currtime_us - lasthandshaketime_us;
-    if (diff < 1000) {
-        return; //ignore everything <1ms after an earlier irq
-    }
-    lasthandshaketime_us = currtime_us;
+// --- دالة استدعاء التقاط الحزم الخام (Promiscuous RX Callback) ---
+static void wifi_promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
 
-    //Give the semaphore.
-    BaseType_t mustYield = false;
-    xSemaphoreGiveFromISR(rdySem, &mustYield);
-    if (mustYield) {
-        portYIELD_FROM_ISR();
+    if (len > 0 && len <= BUFFER_SIZE) {
+        // إدخال الحزمة في الـ RingBuffer لنقلها عبر الـ SPI
+        xRingbufferSend(tx_ringbuf, pkt->payload, len, pdMS_TO_TICKS(5));
     }
 }
 
-//Main application
-void app_main(void)
-{
-    esp_err_t ret;
-    spi_device_handle_t handle;
-
-    //Configuration for the SPI bus
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = GPIO_MOSI,
-        .miso_io_num = GPIO_MISO,
-        .sclk_io_num = GPIO_SCLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1
-    };
-
-    //Configuration for the SPI device on the other side of the bus
-    spi_device_interface_config_t devcfg = {
-        .command_bits = 0,
-        .address_bits = 0,
-        .dummy_bits = 0,
-        .clock_speed_hz = 5000000,
-        .duty_cycle_pos = 128,      //50% duty cycle
-        .mode = 0,
-        .spics_io_num = GPIO_CS,
-        .cs_ena_posttrans = 3,      //Keep the CS low 3 cycles after transaction, to stop slave from missing the last bit when CS has less propagation delay than CLK
-        .queue_size = 3
-    };
-
-    //GPIO config for the handshake line.
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = 1,
-        .pin_bit_mask = (1 << GPIO_HANDSHAKE)
-    };
-
-    int n = 0;
-    char sendbuf[128] = {0};
-    char recvbuf[128] = {0};
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-
-    //Create the semaphore.
-    rdySem = xSemaphoreCreateBinary();
-
-    //Set up handshake line interrupt.
-    gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_set_intr_type(GPIO_HANDSHAKE, GPIO_INTR_POSEDGE);
-    gpio_isr_handler_add(GPIO_HANDSHAKE, gpio_handshake_isr_handler, NULL);
-
-    //Initialize the SPI bus and add the device we want to send stuff to.
-    ret = spi_bus_initialize(SENDER_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    assert(ret == ESP_OK);
-    ret = spi_bus_add_device(SENDER_HOST, &devcfg, &handle);
-    assert(ret == ESP_OK);
-
-    //Assume the slave is ready for the first transmission: if the slave started up before us, we will not detect
-    //positive edge on the handshake line.
-    xSemaphoreGive(rdySem);
+// --- مهمة إرسال واستقبال البيانات التزامنية المزدوجة عبر الـ SPI ---
+static void spi_master_duplex_task(void *pvParameters) {
+    size_t item_size = 0;
 
     while (1) {
-        int res = snprintf(sendbuf, sizeof(sendbuf),
-                           "Sender, transmission no. %04i. Last time, I received: \"%s\"", n, recvbuf);
-        if (res >= sizeof(sendbuf)) {
-            printf("Data truncated\n");
+        // 1. الانتظار حتى تكون البوردة الثانية (Slave) جاهزة ومرفوعة الإشارة على Handshake
+        while (gpio_get_level(GPIO_HANDSHAKE) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
-        t.length = sizeof(sendbuf) * 8;
-        t.tx_buffer = sendbuf;
-        t.rx_buffer = recvbuf;
-        //Wait for slave to be ready for next byte before sending
-        xSemaphoreTake(rdySem, portMAX_DELAY); //Wait until slave is ready
-        ret = spi_device_transmit(handle, &t);
-        printf("Received: %s\n", recvbuf);
-        n++;
+
+        // تفريغ أوفست الذاكرة الموقتة
+        memset(master_tx_buf, 0, BUFFER_SIZE);
+        memset(master_rx_buf, 0, BUFFER_SIZE);
+
+        // 2. سحب حزمة Downlink متجهة للبوردة الثانية إن وجدت
+        uint8_t *item = (uint8_t *)xRingbufferReceive(tx_ringbuf, &item_size, pdMS_TO_TICKS(2));
+        if (item != NULL) {
+            memcpy(master_tx_buf, item, item_size);
+            vRingbufferReturnItem(tx_ringbuf, (void *)item);
+        } else {
+            item_size = 0;
+        }
+
+        spi_transaction_t t;
+        memset(&t, 0, sizeof(t));
+        t.length = BUFFER_SIZE * 8; // الطول بالبت
+        t.tx_buffer = master_tx_buf;
+        t.rx_buffer = master_rx_buf;
+
+        // 3. تنفيذ تبادل البيانات التزامني (Full-Duplex SPI DMA)
+        esp_err_t ret = spi_device_transmit(spi_handle, &t);
+
+        if (ret == ESP_OK) {
+            // 4. إذا أرجعت البوردة الثانية حزمة Uplink قادمة من الأجهزة، نحقنها مباشرة للراوتر
+            uint16_t rx_len = (master_rx_buf[12] << 8) | master_rx_buf[13]; // قراءة الطول التقريبي من الهيدر
+            if (rx_len > 0 && rx_len <= BUFFER_SIZE) {
+                esp_wifi_80211_tx(WIFI_IF_STA, master_rx_buf, rx_len, false);
+            }
+        }
+    }
+}
+
+// --- تهيئة الـ SPI Master ---
+static void init_spi_master(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_HANDSHAKE),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&io_conf);
+
+    spi_bus_config_t buscfg = {
+        .miso_io_num = GPIO_MISO,
+        .mosi_io_num = GPIO_MOSI,
+        .sclk_io_num = GPIO_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = BUFFER_SIZE,
+    };
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10 * 1000 * 1000, // سرعة 10 ميجاهرتز
+        .mode = 0,
+        .spics_io_num = GPIO_CS,
+        .queue_size = 7,
+    };
+
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi_handle));
+}
+
+// --- تهيئة الـ Wi-Fi والاتصال بالراوتر وتفعيل الالتقاط الشفاف ---
+static void init_wifi_sta(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = ROUTER_SSID,
+            .password = ROUTER_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    // الاتصال بالراوتر للإنهاء المباشر للتشفير
+    ESP_LOGI(TAG, "Connecting to router: %s...", ROUTER_SSID);
+    ESP_ERROR_CHECK(esp_wifi_connect());
+
+    // تفعيل وضع الالتقاط الشفاف
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_rx_cb));
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Starting Master Full-Duplex Node...");
+
+    // 1. إنشاء الـ RingBuffer لحفظ الحزم
+    tx_ringbuf = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_NOSPLIT);
+    if (tx_ringbuf == NULL) {
+        ESP_LOGE(TAG, "Failed to create RingBuffer!");
+        return;
     }
 
-    //Never reached.
-    ret = spi_bus_remove_device(handle);
-    assert(ret == ESP_OK);
+    // 2. تهيئة الـ SPI والـ Wi-Fi
+    init_spi_master();
+    init_wifi_sta();
+
+    // 3. إطلاق مهمة النقل المزدوج عبر الـ SPI
+    xTaskCreate(spi_master_duplex_task, "spi_master_duplex_task", 4096, NULL, 5, NULL);
 }
