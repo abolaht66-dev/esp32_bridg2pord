@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.1
 
     steps:
     - name: Checkout repository
@@ -15,18 +17,26 @@ jobs:
       with:
         submodules: recursive
 
-    - name: esp-idf build
-      uses: espressif/esp-idf-action-mfg@v1
-      with:
-        esp_idf_version: v5.1
-        target: esp32
+    - name: Build Sender (Master)
+      run: |
+        . /opt/esp/idf/export.sh
+        cd sender
+        idf.py build
+
+    - name: Build Receiver (Slave)
+      run: |
+        . /opt/esp/idf/export.sh
+        cd receiver
+        idf.py build
 
     - name: Upload Binaries Artifact
       uses: actions/upload-artifact@v4
       with:
         name: esp32-firmware-binaries
         path: |
-          **/build/*.bin
-          **/build/bootloader/*.bin
-          **/build/partition_table/*.bin
-          **/build/flasher_args.json
+          sender/build/*.bin
+          sender/build/bootloader/*.bin
+          sender/build/partition_table/*.bin
+          receiver/build/*.bin
+          receiver/build/bootloader/*.bin
+          receiver/build/partition_table/*.bin
